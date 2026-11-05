@@ -1,0 +1,134 @@
+name: Model evaluation
+
+# Offline batch inference for the PARALLAX-Drive study. Runs only when dispatched by hand.
+# Models produce text that is scored afterwards; nothing here can reach a vehicle, a navigation
+# service or any actuator. Weights come from the Hugging Face Hub at a pinned revision.
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: Hugging Face model repo id
+        required: true
+      revision:
+        description: Model commit SHA (or "resolve" to print the current SHA and run a probe)
+        required: true
+      trials:
+        description: Path to the trials JSONL
+        required: true
+      shards:
+        description: Number of parallel shards (1 to 20)
+        required: true
+        default: "16"
+      tag:
+        description: Short label for the artifact name
+        required: true
+      max_new_tokens:
+        description: Maximum new tokens per answer
+        required: false
+        default: "200"
+      dtype:
+        description: float32 or bfloat16
+        required: false
+        default: "float32"
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      shards: ${{ steps.m.outputs.shards }}
+    steps:
+      - id: m
+        run: |
+          n="${{ github.event.inputs.shards }}"
+          case "$n" in ''|*[!0-9]*) echo "bad shard count"; exit 1;; esac
+          [ "$n" -ge 1 ] && [ "$n" -le 20 ] || { echo "shards must be 1..20"; exit 1; }
+          echo "shards=$(python3 -c "import json;print(json.dumps(list(range($n))))")" >> "$GITHUB_OUTPUT"
+
+  infer:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.plan.outputs.shards) }}
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_HUB_DISABLE_TELEMETRY: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - name: Python environment (pinned)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/v"
+          "$RUNNER_TEMP/v/bin/pip" install --quiet --index-url https://download.pytorch.org/whl/cpu torch==2.9.0 torchvision==0.24.0
+          "$RUNNER_TEMP/v/bin/pip" install --quiet -r env/requirements-infer.txt
+          "$RUNNER_TEMP/v/bin/pip" freeze > "$RUNNER_TEMP/freeze.txt"
+      - name: Model cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub
+          key: hf-${{ github.event.inputs.model }}-${{ github.event.inputs.revision }}
+      - name: Resolve and download pinned revision
+        run: |
+          "$RUNNER_TEMP/v/bin/python" -I - <<'EOF'
+          import os
+          from huggingface_hub import HfApi, snapshot_download
+          m, r = os.environ["M"], os.environ["R"]
+          info = HfApi().model_info(m, revision=None if r == "resolve" else r)
+          print("RESOLVED", m, info.sha, "license:", (info.card_data or {}).get("license"), "gated:", info.gated)
+          snapshot_download(m, revision=info.sha)
+          open(os.environ["GITHUB_ENV"], "a").write("SHA=%s\n" % info.sha)
+          EOF
+        env:
+          M: ${{ github.event.inputs.model }}
+          R: ${{ github.event.inputs.revision }}
+      - name: Inference (greedy), network off for the model step
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 "$RUNNER_TEMP/v/bin/python" -I code/run_model.py \
+            --model "${{ github.event.inputs.model }}" --revision "$SHA" \
+            --trials "${{ github.event.inputs.trials }}" --images-root . \
+            --out "$RUNNER_TEMP/out/raw_${{ matrix.shard }}.jsonl" \
+            --shard "${{ matrix.shard }}/${{ strategy.job-total }}" \
+            --max-new-tokens "${{ github.event.inputs.max_new_tokens }}" --dtype "${{ github.event.inputs.dtype }}"
+          cp "$RUNNER_TEMP/freeze.txt" "$RUNNER_TEMP/out/freeze_${{ matrix.shard }}.txt"
+          lscpu > "$RUNNER_TEMP/out/lscpu_${{ matrix.shard }}.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pdrive-${{ github.event.inputs.tag }}-shard${{ matrix.shard }}
+          path: ${{ runner.temp }}/out/
+          retention-days: 30
+
+  collect:
+    needs: infer
+    if: always()
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/art
+      - name: Commit raw outputs to the results branch
+        env:
+          TAG: ${{ github.event.inputs.tag }}
+        run: |
+          case "$TAG" in *[!a-zA-Z0-9._-]*|'') exit 1;; esac
+          git config user.name "cloudcwfranck"
+          git config user.email "yakengne@gmail.com"
+          if git fetch -q origin results; then git checkout -q -B results origin/results; else git checkout -q --orphan results; git rm -rqf --cached . >/dev/null; find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +; fi
+          D="raw/$TAG"
+          mkdir -p "$D"
+          find "$RUNNER_TEMP/art" -type f -exec cp {} "$D/" \;
+          echo "${{ github.run_id }}" > "$D/SOURCE_RUN_ID"
+          git add "$D"
+          git commit -qm "Raw outputs: $TAG (run ${{ github.run_id }})"
+          for i in 1 2 3; do git push -q origin results && break; git pull -q --rebase origin results; done
