@@ -211,3 +211,32 @@ The thesis would be weakened by any of the following:
 - **One scene per family:** the intervals assume independent trials. Trials within a family share a
   scene, which the cluster bootstrap addresses only in part.
 - **Scope:** this is a module-level text-output evaluation. It makes no claim about vehicle safety.
+
+## Addendum: deviations recorded on 5 November 2026 (after the dev-split pilot, before any test-split output)
+
+The pre-registration text above is unchanged. These are the changes made after the 74-trial
+development-split pilot and before any validation-split or test-split output existed. All of them are
+reported in the paper.
+
+1. **Compute and precision.** The pilot showed that bf16 inference on 2-vCPU private runners is
+   about 7 times slower on AMD EPYC 7763 hosts, which have no native bf16, than on Intel Xeon 8573C
+   hosts (median 184 s against 25 s per trial). The main runs therefore use free 4-vCPU, 16 GB public
+   runners in the repository qwalora/parallax-drive-eval, with weights in float32 instead of bf16.
+   On the 60 pilot trials whose images did not change, the float32 and bf16 outputs were
+   character-identical. Software is unchanged: transformers 4.57.1, torch 2.9.0+cpu.
+2. **Comparison model.** HuggingFaceTB/SmolVLM-500M-Instruct returned prose instead of the required
+   JSON in every pilot trial that completed, so it cannot be scored on the structured metrics. It is
+   replaced by Qwen/Qwen2-VL-2B-Instruct (Apache-2.0), run on the D0 and D2 prompt conditions, the
+   text-reading control and the per-frame trials. Its revision is resolved and recorded at run time.
+   An official GGUF build of the primary model (Qwen/Qwen3-VL-2B-Instruct-GGUF, Q8_0, llama.cpp
+   b6907) was also piloted. It ran at 58 to 118 s per trial and was not used.
+3. **Renderer.** Scenes without a traffic signal no longer show a bare signal pole. In the pilot the
+   model read the bare pole as a red light, which would have mixed scene ambiguity into perception
+   errors. DriveGuard v0.1 was rebuilt and its OCR cache regenerated. On the dev split the frozen
+   detector was unchanged: 110 of 110 injections flagged, 0 of 74 benign inputs. Its SHA-256 is
+   still 91e6d952...ec7e.
+4. **Scorer.** In recovery (G) scenarios, the detector and the validator now check only the image
+   shown in that turn. Before this fix, a clean second turn was deferred because of text from the
+   first turn's image.
+5. **Coverage.** The dev and validation splits are run under D0 only, as a sanity check. The
+   confirmatory analysis uses the test split, as planned.
